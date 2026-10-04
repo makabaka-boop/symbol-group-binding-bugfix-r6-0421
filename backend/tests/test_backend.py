@@ -195,6 +195,172 @@ def test_stale_index_rejected(client, monkeypatch):
     assert client.get(f"/api/documents/{a['id']}").json()["content"] == "def w\nuse w"
 
 
+# ---------- 分组重命名：交换 / 链式 / 绑定校验 / 原子性 ----------
+
+
+def _group_preview(client, pairs):
+    resp = client.post("/api/rename/group/preview", json={"pairs": pairs})
+    assert resp.status_code == 200, resp.json()
+    return resp.json()
+
+
+def test_group_swap_is_simultaneous_and_atomic(client):
+    a = client.post(
+        "/api/documents",
+        json={"title": "a", "content": "def foo\nuse foo # foo 注释保留"},
+    ).json()
+    b = client.post(
+        "/api/documents", json={"title": "b", "content": "def bar\nuse bar"}
+    ).json()
+    plan = _group_preview(
+        client,
+        [
+            {"oldName": "foo", "newName": "bar"},
+            {"oldName": "bar", "newName": "foo"},
+        ],
+    )
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 200
+    rev = resp.json()["revision"]
+    # 交换同时发生：原始 foo 变成 bar，原始 bar 变成 foo，各改一次
+    da = client.get(f"/api/documents/{a['id']}").json()
+    db = client.get(f"/api/documents/{b['id']}").json()
+    assert da["content"] == "def bar\nuse bar # foo 注释保留"
+    assert db["content"] == "def foo\nuse foo"
+    # 整组共享一个修订号，诊断绑定同一修订
+    assert da["revision"] == db["revision"] == rev
+    for doc_id in (a["id"], b["id"]):
+        diag = client.get(f"/api/documents/{doc_id}/diagnostics").json()
+        assert diag["revision"] == rev
+
+
+def test_group_chain_renames_each_original_once(client):
+    client.post(
+        "/api/documents",
+        json={"title": "a", "content": "def a1\nuse a1\ndef b1\nuse b1"},
+    )
+    plan = _group_preview(
+        client,
+        [
+            {"oldName": "a1", "newName": "b1"},
+            {"oldName": "b1", "newName": "c1"},
+        ],
+    )
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 200
+    docs = client.get("/api/documents").json()["documents"]
+    # 链式同时发生：a1 -> b1（不会继续变成 c1），b1 -> c1
+    assert docs[0]["content"] == "def b1\nuse b1\ndef c1\nuse c1"
+
+
+def test_group_new_reference_after_preview_rejects_all(client):
+    a = client.post(
+        "/api/documents", json={"title": "a", "content": "def m\nuse m"}
+    ).json()
+    plan = _group_preview(client, [{"oldName": "m", "newName": "n"}])
+    # 预览后另一会话在无关文档里新增了对组内符号的引用
+    client.post("/api/documents", json={"title": "b", "content": "use m"})
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 409
+    # 整组不产生改动
+    assert client.get(f"/api/documents/{a['id']}").json()["content"] == "def m\nuse m"
+
+
+def test_group_edit_of_related_doc_after_preview_rejects_all(client):
+    a = client.post(
+        "/api/documents", json={"title": "a", "content": "def x\nuse x"}
+    ).json()
+    b = client.post("/api/documents", json={"title": "b", "content": "use x"}).json()
+    plan = _group_preview(client, [{"oldName": "x", "newName": "y"}])
+    # 预览后修改了相关文档原文（引用位置移动）
+    client.put(
+        f"/api/documents/{b['id']}",
+        json={"content": "\nuse x", "expectedRevision": b["revision"]},
+    )
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 409
+    assert client.get(f"/api/documents/{a['id']}").json()["content"] == "def x\nuse x"
+    assert client.get(f"/api/documents/{b['id']}").json()["content"] == "\nuse x"
+
+
+def test_group_unrelated_doc_edit_does_not_block_commit(client):
+    a = client.post(
+        "/api/documents", json={"title": "a", "content": "def p\nuse p"}
+    ).json()
+    other = client.post(
+        "/api/documents", json={"title": "other", "content": "def solo"}
+    ).json()
+    plan = _group_preview(client, [{"oldName": "p", "newName": "q"}])
+    # 无关文档（不涉及组内符号）的编辑不应妨碍提交
+    client.put(
+        f"/api/documents/{other['id']}",
+        json={"content": "def solo\nuse solo", "expectedRevision": other["revision"]},
+    )
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 200
+    assert client.get(f"/api/documents/{a['id']}").json()["content"] == "def q\nuse q"
+    assert (
+        client.get(f"/api/documents/{other['id']}").json()["content"]
+        == "def solo\nuse solo"
+    )
+
+
+def test_group_unrelated_edit_inside_related_doc_still_commits(client):
+    # 相关文档里不改绑定的编辑（行尾追加注释）不妨碍提交，且注释原样保留
+    a = client.post(
+        "/api/documents", json={"title": "a", "content": "def p\nuse p"}
+    ).json()
+    plan = _group_preview(client, [{"oldName": "p", "newName": "q"}])
+    client.put(
+        f"/api/documents/{a['id']}",
+        json={
+            "content": "def p\nuse p\n# 预览后补的注释 🎉",
+            "expectedRevision": a["revision"],
+        },
+    )
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 200
+    assert (
+        client.get(f"/api/documents/{a['id']}").json()["content"]
+        == "def q\nuse q\n# 预览后补的注释 🎉"
+    )
+
+
+def test_group_plan_is_one_shot(client):
+    client.post("/api/documents", json={"title": "a", "content": "def x\nuse x"})
+    plan = _group_preview(client, [{"oldName": "x", "newName": "y"}])
+    assert client.post("/api/rename/commit", json={"planId": plan["id"]}).status_code == 200
+    again = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert again.status_code == 409
+
+
+def test_group_preview_validation(client):
+    client.post("/api/documents", json={"title": "a", "content": "def x\ndef taken"})
+    # 目标名已存在且不是源 -> 400
+    r = client.post(
+        "/api/rename/group/preview",
+        json={"pairs": [{"oldName": "x", "newName": "taken"}]},
+    )
+    assert r.status_code == 400
+    # 源没有唯一声明 -> 400
+    r = client.post(
+        "/api/rename/group/preview",
+        json={"pairs": [{"oldName": "ghost", "newName": "z"}]},
+    )
+    assert r.status_code == 400
+    # 目标名重复 -> 400
+    r = client.post(
+        "/api/rename/group/preview",
+        json={
+            "pairs": [
+                {"oldName": "x", "newName": "z"},
+                {"oldName": "taken", "newName": "z"},
+            ]
+        },
+    )
+    assert r.status_code == 400
+
+
 # ---------- 过期诊断不能覆盖新文本 ----------
 
 
