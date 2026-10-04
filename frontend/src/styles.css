@@ -1,0 +1,167 @@
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: #1e1e1e;
+  color: #d4d4d4;
+}
+
+.app { display: flex; flex-direction: column; height: 100%; }
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  background: #252526;
+  border-bottom: 1px solid #3c3c3c;
+}
+.logo { font-weight: 700; color: #569cd6; }
+.conn { font-size: 12px; }
+.conn.on { color: #4ec9b0; }
+.conn.off { color: #c586c0; }
+
+button {
+  background: #0e639c;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+button:hover { background: #1177bb; }
+button:disabled { background: #3c3c3c; color: #858585; cursor: default; }
+button.primary { background: #107c10; }
+button.primary:hover { background: #159115; }
+
+.body { flex: 1; display: flex; min-height: 0; }
+
+.sidebar {
+  width: 220px;
+  background: #252526;
+  border-right: 1px solid #3c3c3c;
+  overflow-y: auto;
+  padding: 6px 0;
+}
+.doc-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.doc-item:hover { background: #2a2d2e; }
+.doc-item.active { background: #37373d; }
+.doc-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc-rev { font-size: 11px; color: #858585; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.dot.dirty { background: #d7ba7d; }
+.dot.conflict { background: #f48771; }
+
+.editor-pane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.doc-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  background: #2d2d30;
+  border-bottom: 1px solid #3c3c3c;
+  font-size: 13px;
+}
+.rev-tag { color: #9cdcfe; font-size: 12px; }
+.diag-summary { font-size: 12px; color: #b5cea8; }
+.diag-summary.has-err { color: #f48771; }
+.spacer { flex: 1; }
+
+.editor-host { flex: 1; min-height: 0; }
+
+.conflict-banner {
+  padding: 10px 14px;
+  background: #5a1d1d;
+  border-bottom: 1px solid #f48771;
+  font-size: 13px;
+}
+.conflict-actions { margin-top: 8px; display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
+.remote-view {
+  max-height: 160px;
+  overflow: auto;
+  background: #1e1e1e;
+  padding: 8px;
+  border: 1px solid #3c3c3c;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.empty-hint { padding: 12px; color: #858585; font-size: 13px; }
+.empty-hint.big { margin: auto; }
+
+.toast {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #007acc;
+  color: #fff;
+  padding: 10px 18px;
+  border-radius: 6px;
+  font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  z-index: 100;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.modal {
+  background: #252526;
+  border: 1px solid #3c3c3c;
+  border-radius: 8px;
+  width: min(760px, 92vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  padding: 18px 20px;
+}
+.modal h2 { margin: 0 0 14px; font-size: 17px; }
+.form-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.form-row label { width: 90px; font-size: 13px; }
+.form-row input {
+  flex: 1;
+  background: #1e1e1e;
+  border: 1px solid #3c3c3c;
+  color: #d4d4d4;
+  border-radius: 4px;
+  padding: 7px 10px;
+  font-family: ui-monospace, monospace;
+}
+.error-box {
+  background: #5a1d1d;
+  border: 1px solid #f48771;
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 13px;
+  margin: 6px 0;
+}
+.plan-box { margin-top: 8px; overflow-y: auto; }
+.plan-meta { font-size: 13px; margin-bottom: 10px; color: #9cdcfe; }
+.diff { border: 1px solid #3c3c3c; border-radius: 6px; margin-bottom: 10px; overflow: hidden; }
+.diff-title { background: #2d2d30; padding: 6px 10px; font-size: 13px; }
+.diff pre {
+  margin: 0;
+  padding: 8px 10px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+.diff-before { background: #2a1d1d; color: #f48771; }
+.diff-after { background: #1d2a1d; color: #b5cea8; }
+.warn-line { font-size: 12px; color: #d7ba7d; margin: 6px 0; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 12px; }
