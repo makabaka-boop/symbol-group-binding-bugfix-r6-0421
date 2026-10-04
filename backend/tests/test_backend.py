@@ -292,3 +292,219 @@ def test_sessions_receive_diagnostics_broadcast(client):
         msg = ws.receive_json()
         assert msg["type"] == "diagnostics"
         assert msg["revision"] == d["revision"]
+
+
+# ---------- 成组重命名：交换 / 链式一次同步生效 ----------
+
+
+def _group_preview(client, pairs):
+    return client.post("/api/rename/group/preview", json={"pairs": pairs}).json()
+
+
+def test_group_swap_commits_simultaneously(client):
+    a = client.post(
+        "/api/documents", json={"title": "a", "content": "def a\nuse a # 注释里的 a"}
+    ).json()
+    b = client.post(
+        "/api/documents", json={"title": "b", "content": "def b\nuse b"}
+    ).json()
+
+    plan = _group_preview(
+        client,
+        [{"oldName": "a", "newName": "b"}, {"oldName": "b", "newName": "a"}],
+    )
+    # 预览已经展示交换后的同步结果
+    after = {p["docId"]: p["after"] for p in plan["previews"]}
+    assert after[a["id"]] == "def b\nuse b # 注释里的 a"
+    assert after[b["id"]] == "def a\nuse a"
+
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 200
+    result = resp.json()
+    # 每个原始声明/引用只按本组对应关系改变一次
+    assert client.get(f"/api/documents/{a['id']}").json()["content"] == after[a["id"]]
+    assert client.get(f"/api/documents/{b['id']}").json()["content"] == after[b["id"]]
+    # 整组共享同一 revision
+    rev = result["revision"]
+    assert {d["revision"] for d in result["documents"]} == {rev}
+    assert client.get(f"/api/documents/{a['id']}").json()["revision"] == rev
+    assert client.get(f"/api/documents/{b['id']}").json()["revision"] == rev
+    # 计划一次性
+    again = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert again.status_code == 409
+
+
+def test_group_chain_order_independent_and_single_rewrite(client):
+    # 对组对应关系 b->a、a->x：即使按“先 b->a 再 a->x”的顺序逐条执行会失败/二改，
+    # 提交也必须按预览同步生效，且每处只改一次。
+    a = client.post(
+        "/api/documents", json={"title": "a", "content": "def a\nuse a"}
+    ).json()
+    b = client.post(
+        "/api/documents", json={"title": "b", "content": "def b\nuse b"}
+    ).json()
+
+    plan = _group_preview(
+        client,
+        [{"oldName": "b", "newName": "a"}, {"oldName": "a", "newName": "x"}],
+    )
+    after = {p["docId"]: p["after"] for p in plan["previews"]}
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 200
+    assert client.get(f"/api/documents/{a['id']}").json()["content"] == after[a["id"]]
+    assert client.get(f"/api/documents/{b['id']}").json()["content"] == after[b["id"]]
+    # b 不会被先改成 a 再改成 x；a 的原始出现全部只到 x
+    assert "def a" not in client.get(f"/api/documents/{a['id']}").json()["content"]
+    assert client.get(f"/api/documents/{b['id']}").json()["content"].count("def a") == 1
+
+
+def test_group_new_reference_after_preview_rejects_whole_group(client):
+    a = client.post(
+        "/api/documents", json={"title": "a", "content": "def p\nuse p"}
+    ).json()
+    b = client.post("/api/documents", json={"title": "b", "content": "def q"}).json()
+
+    plan = _group_preview(
+        client,
+        [{"oldName": "p", "newName": "r"}, {"oldName": "q", "newName": "s"}],
+    )
+    # 预览后新增了对组符号的引用
+    client.put(
+        f"/api/documents/{a['id']}",
+        json={"content": "def p\nuse p\nuse q", "expectedRevision": a["revision"]},
+    )
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 409
+    assert "整组拒绝" in resp.json()["detail"]
+    # 一个文档都不允许先改掉
+    assert (
+        client.get(f"/api/documents/{a['id']}").json()["content"]
+        == "def p\nuse p\nuse q"
+    )
+    assert client.get(f"/api/documents/{b['id']}").json()["content"] == "def q"
+
+
+def test_group_binding_change_without_revision_bump_rejected(client):
+    # 极端情况：绕过 API 直接改库（revision 不变），新增了组符号绑定。
+    import backend.main as main
+
+    a = client.post(
+        "/api/documents", json={"title": "a", "content": "def p\nuse p"}
+    ).json()
+    plan = _group_preview(client, [{"oldName": "p", "newName": "r"}])
+    main.store._conn.execute(
+        "UPDATE documents SET content=? WHERE id=?",
+        ("def p\nuse p\nuse p", a["id"]),
+    )
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 409
+    assert client.get(f"/api/documents/{a['id']}").json()["content"] == (
+        "def p\nuse p\nuse p"
+    )
+
+
+def test_group_unrelated_document_edit_does_not_block_commit(client):
+    g = client.post(
+        "/api/documents", json={"title": "g", "content": "def p\nuse p"}
+    ).json()
+    z = client.post(
+        "/api/documents", json={"title": "z", "content": "# 无关文档\ndef keeper"}
+    ).json()
+
+    plan = _group_preview(client, [{"oldName": "p", "newName": "r"}])
+    # 预览后编辑的文档不含任何组符号出现：不影响提交
+    client.put(
+        f"/api/documents/{z['id']}",
+        json={"content": "# 无关文档被编辑\ndef keeper", "expectedRevision": z["revision"]},
+    )
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 200
+    assert (
+        client.get(f"/api/documents/{g['id']}").json()["content"] == "def r\nuse r"
+    )
+
+
+def test_group_preserves_comments(client):
+    a = client.post(
+        "/api/documents",
+        json={"title": "a", "content": "def p # p 在注释里 🎉\nuse p\n# p again"},
+    ).json()
+    plan = _group_preview(
+        client,
+        [{"oldName": "p", "newName": "r"}],
+    )
+    resp = client.post("/api/rename/commit", json={"planId": plan["id"]})
+    assert resp.status_code == 200
+    after = client.get(f"/api/documents/{a['id']}").json()["content"]
+    assert after == "def r # p 在注释里 🎉\nuse r\n# p again"
+
+
+def test_group_invalid_pairs_rejected_at_preview(client):
+    client.post("/api/documents", json={"title": "a", "content": "def p\ndef q"})
+    # 源名重复
+    r1 = client.post(
+        "/api/rename/group/preview",
+        json={
+            "pairs": [
+                {"oldName": "p", "newName": "x"},
+                {"oldName": "p", "newName": "y"},
+            ]
+        },
+    )
+    assert r1.status_code == 400
+    # 目标名重复
+    r2 = client.post(
+        "/api/rename/group/preview",
+        json={
+            "pairs": [
+                {"oldName": "p", "newName": "x"},
+                {"oldName": "q", "newName": "x"},
+            ]
+        },
+    )
+    assert r2.status_code == 400
+    # 源缺少声明 / 目标已被声明
+    r3 = client.post(
+        "/api/rename/group/preview",
+        json={"pairs": [{"oldName": "missing", "newName": "x"}]},
+    )
+    assert r3.status_code == 400
+    r4 = client.post(
+        "/api/rename/group/preview",
+        json={"pairs": [{"oldName": "p", "newName": "q"}]},
+    )
+    assert r4.status_code == 400
+
+
+def test_group_notifications_share_one_revision(client):
+    with client.websocket_connect("/ws") as ws1, client.websocket_connect("/ws") as ws2:
+        ws1.receive_json()
+        ws2.receive_json()
+        a = client.post(
+            "/api/documents", json={"title": "a", "content": "def a\nuse a"}
+        ).json()
+        b = client.post(
+            "/api/documents", json={"title": "b", "content": "def b\nuse b"}
+        ).json()
+        ws1.receive_json()
+        ws1.receive_json()
+        ws2.receive_json()
+        ws2.receive_json()
+
+        plan = _group_preview(
+            client,
+            [{"oldName": "a", "newName": "b"}, {"oldName": "b", "newName": "a"}],
+        )
+        result = client.post(
+            "/api/rename/commit", json={"planId": plan["id"]}
+        ).json()
+
+        seen1 = [ws1.receive_json() for _ in range(2)]
+        seen2 = [ws2.receive_json() for _ in range(2)]
+        for msgs in (seen1, seen2):
+            assert all(m["type"] == "document_changed" for m in msgs)
+            assert {m["revision"] for m in msgs} == {result["revision"]}
+        # 文档正文与诊断绑定同一次修订
+        for doc_id in (a["id"], b["id"]):
+            diag = client.get(f"/api/documents/{doc_id}/diagnostics").json()
+            assert diag["revision"] == result["revision"]

@@ -306,8 +306,12 @@ export default function App() {
   const onRenameCommitted = useCallback(
     async (res, plan) => {
       setRenameOpen(false);
+      const label =
+        plan.kind === "group"
+          ? plan.pairs.map((p) => `${p.oldName} → ${p.newName}`).join("，")
+          : `${plan.oldName} → ${plan.newName}`;
       flash(
-        `重命名 ${plan.oldName} → ${plan.newName}：${res.documents.length} 个文档已在 r${res.revision} 原子提交`,
+        `${plan.kind === "group" ? "成组重命名" : "重命名"} ${label}：${res.documents.length} 个文档已在 r${res.revision} 原子提交`,
       );
       // 拉取每个被改文档
       for (const ref of res.documents) {

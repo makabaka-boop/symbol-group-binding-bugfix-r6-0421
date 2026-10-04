@@ -33,30 +33,27 @@ export default function RenameModal({
 
   const preview = async () => {
     setErr("");
-    if (!group.trim() && (!asciiOk(oldName) || !asciiOk(newName))) {
+    const groupPairs = parseGroup(group);
+    if (group.trim() && groupPairs instanceof Error) {
+      setErr(groupPairs.message);
+      return;
+    }
+    if (!groupPairs && (!asciiOk(oldName) || !asciiOk(newName))) {
       setErr("符号名只能是 ASCII 标识符（字母、数字、下划线，数字不开头）");
       return;
     }
-    if (!group.trim() && oldName === newName) {
+    if (!groupPairs && oldName === newName) {
       setErr("新名字与原名相同");
       return;
     }
     setBusy(true);
     try {
       // 预览前先等一个微任务，UI 更顺
-      const pairs = group
-        .trim()
-        .split(/\n/)
-        .filter(Boolean)
-        .map((line) => {
-          const [oldName, newName] = line.split("->").map((x) => x.trim());
-          return { oldName, newName };
-        });
-      const p = group.trim()
+      const p = groupPairs
         ? await fetch("/api/rename/group/preview", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ pairs }),
+            body: JSON.stringify({ pairs: groupPairs }),
           }).then(async (r) => {
             const data = await r.json();
             if (!r.ok) throw new Error(data.detail);
@@ -174,4 +171,41 @@ export default function RenameModal({
       </div>
     </div>
   );
+}
+
+// 每行必须恰好是 "旧名 -> 新名"，两个名字都为 ASCII 标识符，
+// 且组内源名、目标名各自唯一（交换与链式在同一时刻生效）。
+// 无内容返回 null；格式错误返回 Error。
+function parseGroup(text) {
+  const lines = text
+    .split(/\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (!lines.length) return null;
+  const re = /^[A-Za-z_][A-Za-z0-9_]*$/;
+  const pairs = [];
+  const sources = new Set();
+  const destinations = new Set();
+  for (const [i, line] of lines.entries()) {
+    const parts = line.split("->");
+    if (parts.length !== 2) {
+      return new Error(`第 ${i + 1} 行格式应为：旧名 -> 新名`);
+    }
+    const oldName = parts[0].trim();
+    const newName = parts[1].trim();
+    if (!re.test(oldName) || !re.test(newName)) {
+      return new Error(`第 ${i + 1} 行的符号名只能是 ASCII 标识符`);
+    }
+    if (oldName === newName) {
+      return new Error(`第 ${i + 1} 行新名字与原名相同`);
+    }
+    if (sources.has(oldName)) return new Error(`源名 ${oldName} 重复出现`);
+    if (destinations.has(newName)) {
+      return new Error(`目标名 ${newName} 被多行使用`);
+    }
+    sources.add(oldName);
+    destinations.add(newName);
+    pairs.push({ oldName, newName });
+  }
+  return pairs;
 }

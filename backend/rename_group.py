@@ -1,10 +1,17 @@
-"""Workspace rename groups, retaining the preview and symbol occurrence evidence."""
+"""Workspace rename groups: build the simultaneous-edit preview and persist it.
+
+预览与提交必须描述同一次操作：这里生成的每个 Edit 都按 *本组对应关系*
+同时映射（交换、链式都是一次同步改名），并连同基准 revision 与绑定证据
+一起入库；提交端（Store.commit_group_plan）只执行这里记录的 edits，
+绝不在确认时重新推导计划。
+"""
 
 import json
 import time
 import uuid
+
 from .minilang import parse, is_ascii_name
-from .store import StoreError, ConflictError, Edit, apply_edits_preview
+from .store import StoreError, Edit, apply_edits_preview, group_bindings
 
 
 def mapping_of(pairs):
@@ -19,18 +26,6 @@ def mapping_of(pairs):
     if not mapping:
         raise StoreError("empty rename group")
     return mapping
-
-
-def bindings(docs, names):
-    return {
-        d["id"]: [
-            (o.name, o.range.start.offset, o.range.end.offset)
-            for o in parse(d["content"]).occurrences
-            if o.name in names
-        ]
-        for d in docs
-        if any(o.name in names for o in parse(d["content"]).occurrences)
-    }
 
 
 def preview(store, pairs):
@@ -82,25 +77,25 @@ def preview(store, pairs):
             "createdAt": time.time(),
             "baselines": baselines,
             "edits": edits,
-            "bindings": bindings(docs, set(mapping) | set(mapping.values())),
+            "bindings": group_bindings(
+                docs, set(mapping) | set(mapping.values())
+            ),
             "previews": previews,
         }
-        store._conn.execute(
-            "INSERT INTO rename_plans VALUES(?,?,?,?,?)",
-            (plan["id"], "", "", plan["createdAt"], json.dumps(plan)),
-        )
+        try:
+            store._conn.execute("BEGIN IMMEDIATE")
+            store._conn.execute(
+                "INSERT INTO rename_plans VALUES(?,?,?,?,?)",
+                (plan["id"], "", "", plan["createdAt"], json.dumps(plan)),
+            )
+            store._gc_plans_locked()
+            store._conn.commit()
+        except Exception:
+            store._conn.rollback()
+            raise
         return plan
 
 
 def commit(store, plan):
-    documents = []
-    for pair in plan["pairs"]:
-        step = store.build_rename_plan(pair["oldName"], pair["newName"])
-        result = store.commit_rename(step["id"])
-        documents.extend(result["documents"])
-    store._conn.execute("DELETE FROM rename_plans WHERE id=?", (plan["id"],))
-    return {
-        "planId": plan["id"],
-        "documents": documents,
-        "revision": result["revision"],
-    }
+    """Compatibility wrapper: the single-transaction execution lives in Store."""
+    return store.commit_group_plan(plan)

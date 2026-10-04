@@ -314,9 +314,7 @@ class Store:
             plan = json.loads(row[0])
 
             if plan.get("kind") == "group":
-                from .rename_group import commit
-
-                return commit(self, plan)
+                return self.commit_group_plan(plan)
 
             # 分组
             by_doc: dict[str, list[dict]] = {}
@@ -402,6 +400,126 @@ class Store:
             ],
         }
 
+    def commit_group_plan(self, plan: dict) -> dict:
+        """原子提交成组重命名（交换/链式在同一时刻生效）。
+
+        严格按预览时生成并存储的 edits 执行，绝不在提交时重新推导计划，
+        因此预览展示的改后文本与最终落库内容一致。单事务内：
+        1) 计划必须仍存在（一次性）；
+        2) 预览涉及的每个文档 revision 仍等于基准（相关文档被编辑 → 整组拒绝）；
+        3) 全工作区内组符号（源 + 目标）的绑定证据必须与预览时逐处一致
+           （新增/删除/移动相关声明或引用 → 整组拒绝）；
+        4) 逐处校验偏移处文本仍是 oldText（索引失效 → 整组拒绝）。
+        任何一步失败全部回滚；无关文档（不含任何组符号出现）的编辑不参与校验。
+        """
+        from .rename_group import mapping_of
+
+        plan_id = plan["id"]
+        mapping = mapping_of(plan["pairs"])
+        names = set(mapping) | set(mapping.values())
+
+        by_doc: dict[str, list[dict]] = {}
+        for ed in plan["edits"]:
+            by_doc.setdefault(ed["docId"], []).append(ed)
+
+        with self._lock:
+            new_revision = self._next_revision_locked()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+
+                row = self._conn.execute(
+                    "SELECT payload FROM rename_plans WHERE id=?", (plan_id,)
+                ).fetchone()
+                if row is None:
+                    raise ConflictError(
+                        "重命名计划不存在或已失效，请重新生成预览"
+                    )
+
+                # 1) 所有被改文档的 revision 必须仍等于计划基准
+                current: dict[str, tuple] = {}
+                for doc_id, baseline in plan["baselines"].items():
+                    r = self._conn.execute(
+                        "SELECT id, title, content, revision FROM documents WHERE id=?",
+                        (doc_id,),
+                    ).fetchone()
+                    if r is None:
+                        raise ConflictError(f"文档 {doc_id} 已被删除，整组拒绝")
+                    if r[3] != baseline:
+                        raise ConflictError(
+                            f"文档 {r[1]!r} 在预览期间被修改（基准 {baseline} -> 当前 {r[3]}），整组拒绝"
+                        )
+                    current[doc_id] = r
+
+                # 2) 组符号的绑定证据必须与预览时完全一致（含不含组符号的无关文档）
+                all_rows = self._conn.execute(
+                    "SELECT id, title, content FROM documents"
+                ).fetchall()
+                docs_now = [
+                    {"id": r[0], "title": r[1], "content": r[2]} for r in all_rows
+                ]
+                now_bindings = {
+                    doc_id: sorted(evidence)
+                    for doc_id, evidence in group_bindings(docs_now, names).items()
+                }
+                old_bindings = {
+                    doc_id: sorted(tuple(t) for t in evidence)
+                    for doc_id, evidence in plan["bindings"].items()
+                }
+                if now_bindings != old_bindings:
+                    raise ConflictError(
+                        "组内符号的声明或引用在预览后发生变化，整组拒绝，请重新生成预览"
+                    )
+
+                # 3) 逐文档倒序应用预览中记录的偏移替换，每处 old_text 必须匹配
+                now = time.time()
+                updated: list[dict] = []
+                for doc_id, eds in by_doc.items():
+                    r = current[doc_id]
+                    content = r[2]
+                    for ed in sorted(
+                        eds, key=lambda e: e["startOffset"], reverse=True
+                    ):
+                        s, e = ed["startOffset"], ed["endOffset"]
+                        if content[s:e] != ed["oldText"]:
+                            raise ConflictError(
+                                f"文档 {r[1]!r} 的索引已失效（偏移 {s} 处文本不是 "
+                                f"{ed['oldText']!r}），整组拒绝"
+                            )
+                        content = content[:s] + ed["newText"] + content[e:]
+                    self._conn.execute(
+                        "UPDATE documents SET content=?, revision=?, updated_at=? WHERE id=?",
+                        (content, new_revision, now, doc_id),
+                    )
+                    self._update_diagnostics_locked(doc_id, content, new_revision)
+                    updated.append(
+                        {
+                            "id": doc_id,
+                            "title": r[1],
+                            "content": content,
+                            "revision": new_revision,
+                            "updatedAt": now,
+                        }
+                    )
+
+                self._conn.execute(
+                    "DELETE FROM rename_plans WHERE id=?", (plan_id,)
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+        return {
+            "planId": plan_id,
+            "kind": "group",
+            "pairs": plan["pairs"],
+            "revision": new_revision,
+            "documents": [
+                {"id": u["id"], "title": u["title"], "revision": u["revision"]}
+                for u in updated
+            ],
+        }
+
     def _gc_plans_locked(self) -> None:
         cutoff = time.time() - 600
         self._conn.execute("DELETE FROM rename_plans WHERE created_at < ?", (cutoff,))
@@ -431,3 +549,21 @@ def apply_edits_preview(content: str, edits: list[dict]) -> str:
         s, e = ed["startOffset"], ed["endOffset"]
         out = out[:s] + ed["newText"] + out[e:]
     return out
+
+
+def group_bindings(docs: list[dict], names: set[str]) -> dict[str, list[tuple]]:
+    """组符号在每个文档中的绑定证据：(kind, name, start_offset, end_offset)。
+
+    仅收录至少出现一次组符号的文档；预览时与提交时各取一次并逐处对比，
+    任何新增/删除/移动的声明或引用（即使修订号被旁路篡改）都会使整组失效。
+    注释区间由解析器排除，永远不会出现在证据中。
+    """
+    return {
+        d["id"]: [
+            (o.kind, o.name, o.range.start.offset, o.range.end.offset)
+            for o in parse(d["content"]).occurrences
+            if o.name in names
+        ]
+        for d in docs
+        if any(o.name in names for o in parse(d["content"]).occurrences)
+    }

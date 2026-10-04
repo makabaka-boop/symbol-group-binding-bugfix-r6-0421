@@ -145,6 +145,109 @@ async def main():
         for f in (final1, final2):
             print("   ", f["title"], "r", f["revision"], "->", repr(f["content"]))
 
+        # 11) 成组重命名：交换 + 链式一次同步提交
+        ga = (
+            await http.post(
+                "/api/documents",
+                json={"title": "group_a.mini", "content": "def aa\nuse aa # aa 注释"},
+            )
+        ).json()
+        gb = (
+            await http.post(
+                "/api/documents",
+                json={"title": "group_b.mini", "content": "def bb\nuse bb\nuse aa"},
+            )
+        ).json()
+        await ws1.recv()
+        await ws1.recv()
+        await ws2.recv()
+        await ws2.recv()
+
+        gplan = (
+            await http.post(
+                "/api/rename/group/preview",
+                json={
+                    "pairs": [
+                        {"oldName": "aa", "newName": "bb"},
+                        {"oldName": "bb", "newName": "aa"},
+                    ]
+                },
+            )
+        ).json()
+        after_a = next(p["after"] for p in gplan["previews"] if p["docId"] == ga["id"])
+        after_b = next(p["after"] for p in gplan["previews"] if p["docId"] == gb["id"])
+        assert after_a == "def bb\nuse bb # aa 注释"
+        assert after_b == "def aa\nuse aa\nuse bb"
+
+        # 预览后新增组符号引用 -> 整组拒绝、一个文档都不改
+        await http.put(
+            f"/api/documents/{ga['id']}",
+            json={
+                "content": "def aa\nuse aa # aa 注释\nuse bb",
+                "expectedRevision": ga["revision"],
+            },
+        )
+        await ws1.recv()
+        await ws2.recv()
+        rej_g = await http.post(
+            "/api/rename/commit", json={"planId": gplan["id"]}
+        )
+        assert rej_g.status_code == 409, rej_g.text
+        print("11) 预览后绑定变化 -> 成组提交 409：", rej_g.json()["detail"])
+
+        # 重新预览，这次只改一个无关文档，提交成功且正文与预览一致
+        gplan2 = (
+            await http.post(
+                "/api/rename/group/preview",
+                json={
+                    "pairs": [
+                        {"oldName": "aa", "newName": "bb"},
+                        {"oldName": "bb", "newName": "aa"},
+                    ]
+                },
+            )
+        ).json()
+        unrelated = (
+            await http.post(
+                "/api/documents", json={"title": "unrelated.mini", "content": "# x"}
+            )
+        ).json()
+        await ws1.recv()
+        await ws2.recv()
+        await http.put(
+            f"/api/documents/{unrelated['id']}",
+            json={"content": "# x edited", "expectedRevision": unrelated["revision"]},
+        )
+        await ws1.recv()
+        await ws2.recv()
+        ok_g = (
+            await http.post(
+                "/api/rename/commit", json={"planId": gplan2["id"]}
+            )
+        ).json()
+        print(
+            "12) 无关文档编辑不阻挡：成组交换成功 r",
+            ok_g["revision"],
+            "改了",
+            len(ok_g["documents"]),
+            "个文档",
+        )
+        fa = (await http.get(f"/api/documents/{ga['id']}")).json()
+        fb = (await http.get(f"/api/documents/{gb['id']}")).json()
+        assert fa["revision"] == fb["revision"] == ok_g["revision"]
+        assert fa["content"] == "def bb\nuse bb # aa 注释\nuse aa"
+        assert fb["content"] == "def aa\nuse aa\nuse bb"
+        for _ in range(2):
+            m = json.loads(await ws1.recv())
+            assert m["type"] == "document_changed" and m["revision"] == ok_g["revision"]
+        for _ in range(2):
+            m = json.loads(await ws2.recv())
+            assert m["type"] == "document_changed" and m["revision"] == ok_g["revision"]
+        da = (await http.get(f"/api/documents/{ga['id']}/diagnostics")).json()
+        db = (await http.get(f"/api/documents/{gb['id']}/diagnostics")).json()
+        assert da["revision"] == db["revision"] == ok_g["revision"]
+        print("13) 正文/通知/诊断同属修订 r", ok_g["revision"], "：", repr(fa["content"]), repr(fb["content"]))
+
         await ws1.close()
         await ws2.close()
 
